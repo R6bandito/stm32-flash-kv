@@ -4,13 +4,13 @@
 
 
 /* ****************************************************** */
-	#define DEVICE_STM32F1xx          			(0)
+	#define DEVICE_STM32F1xx          			(1)
 		#if (DEVICE_STM32F1xx)
 			#define CUS_FLASH_BYTE_PER_PAGE		(2048UL)
 			#warning "Please change CUS_FLASH_BYTE_PER_PAGE to your acutal value."
 		#endif 
 
-	#define DEVICE_STM32F4xx          			(1)
+	#define DEVICE_STM32F4xx          			(0)
 		#if (DEVICE_STM32F4xx)
 			#define DEVICE_FLASH_TOTAL_SIZE		(256UL * 1024UL)
 			#warning "Please change DEVICE_FLASH_TOTAL_SIZE to your acutal value. And the format like this: (e.g., 2048*1024 for F42x/F43x)!"

@@ -78,19 +78,38 @@ static inline void __sys_giveSemaphore( void );
 /* ****************************************************** */
 #if (CUS_FLASH_USE_MANAGER)
 
+	/*
+	 * Platform-aware descriptor size.
+	 * STM32F1xx adds a 4‑byte extension (delMark + reserved) so that logical
+	 * deletion can use a separate half‑word without re‑programming the same
+	 * half‑word twice (which the F1 flash controller forbids).  F4xx keeps
+	 * the original 32‑byte layout and uses the validFlag 0xF0F0→0xF0E0
+	 * scheme unchanged.
+	 */
+	#if (DEVICE_STM32F1xx)
+		#define CUS_FLASH_DESC_SIZE   (36U)
+		#define CUS_FLASH_DESC_WORDS  (9U)
+	#else
+		#define CUS_FLASH_DESC_SIZE   (32U)
+		#define CUS_FLASH_DESC_WORDS  (8U)
+	#endif
+
 	typedef struct 
 	{
 		/**
 			 * On-flash layout of a record descriptor header.
 			 * Written verbatim before each user data block by WriteSector when Manager is active.
-			 * Total size is 32 bytes (8 words), word-aligned by design.
-		 */
+			 */
 		uint32_t  Magic;			/**< Magic number (CUS_MANAGER_MAGIC) identifying a valid record. */
 		uint32_t  Size;				/**< Size of the following user data block in bytes. */
 		uint32_t  dataStartAddr;	/**< Absolute Flash address where the user data begins. */
 		uint16_t  Type;				/**< Application-defined data type tag. */
-		uint16_t  validFlag;		/**< Validity flag: 0xF0F0 = valid, any 1→0 transition marks deletion. */
+		uint16_t  validFlag;		/**< Validity flag: 0xF0F0 = valid (F4: 0xF0E0 marks deletion). */
 		char Desc[16];				/**< Human-readable description string (null-padded). */
+	#if (DEVICE_STM32F1xx)
+		uint16_t  delMark;			/**< F1 deletion marker: 0xFFFF = active, 0x0000 = logically deleted. */
+		uint16_t  reserved;			/**< Padding to keep the struct 4‑byte aligned. */
+	#endif
 
 	} desc_t;
 
@@ -422,7 +441,7 @@ Cus_Flash_WriteBuffer( uint32_t StartAddress, uint8_t *pData, uint32_t Buffer_Si
 		return CUS_FLASH_ALIGNED_ERR;
 	}
 
-	Cus_Flash_State_t hReturn =  Cus_Flash_WaitBusy(50);
+	Cus_Flash_State_t hReturn =  Cus_Flash_WaitBusy(150);
 	if ( hReturn != CUS_FLASH_OK )
 	{
 		/* The BUS is still busy. Return. */
@@ -470,7 +489,7 @@ Cus_Flash_WriteBuffer( uint32_t StartAddress, uint8_t *pData, uint32_t Buffer_Si
 		}
 
 		*flash++ = hw;
-		hReturn = Cus_Flash_WaitBusy(50);
+		hReturn = Cus_Flash_WaitBusy(250);
 		if ( hReturn != CUS_FLASH_OK )
 		{
 			/* Reset FLASH_CR. Return. */
@@ -1355,13 +1374,24 @@ Cus_Flash_PVDClr( void )
 		uint32_t scanCount_W = ((end_addr - start_addr) / 4);
 		uint32_t *flash = (uint32_t *)start_addr;
 		uint16_t totalCnt = FLASH_MGR_MAX_RECORDS;
-		uint8_t flash_step = (sizeof(desc_t) / 4);
+		uint8_t flash_step = CUS_FLASH_DESC_WORDS;
 		#define UINT_TO_DESC	((desc_t *)flash)	
 
 		for( uint32_t index = 0; index < scanCount_W; index++ )
 		{
 			if ( (*flash == CUS_MANAGER_MAGIC) && (UINT_TO_DESC->validFlag == 0xF0F0UL) )
 			{
+			#if (DEVICE_STM32F1xx)
+				/* F1: skip records that have been logically deleted (delMark == 0x0000). */
+				if ( UINT_TO_DESC->delMark != 0xFFFFUL )
+				{
+					uint32_t userWords = ((UINT_TO_DESC->Size + 3) / 4);
+					flash += flash_step + userWords;
+					index += (flash_step - 1) + userWords;
+					continue;
+				}
+			#endif
+
 				if ( instance->mgrRecordCount >= FLASH_MGR_MAX_RECORDS )
 				{
 					/* Error. Buffer Overflow. */
@@ -1380,7 +1410,7 @@ Cus_Flash_PVDClr( void )
 
 				memcpy(&instance->mgrRecords[instance->mgrRecordCount++], &record, sizeof(FlashMgr_Record_t));
 
-				if ( (uint32_t)flash + (sizeof(desc_t) + UINT_TO_DESC->Size) > end_addr )
+				if ( (uint32_t)flash + (CUS_FLASH_DESC_SIZE + UINT_TO_DESC->Size) > end_addr )
 				{
 					/* Parsed data would cause out-of-bounds flash access. Return error. */
 					return CUS_FLASH_ERROR;
@@ -1404,9 +1434,9 @@ Cus_Flash_PVDClr( void )
 				uint32_t storeAddr = (uint32_t)flash;
 				uint32_t *pOperation = flash;
 				bool isFree = true;
-				for( uint8_t cnt = 0; cnt < ((sizeof(desc_t) / 4) + 4); cnt++ )
+				for( uint8_t cnt = 0; cnt < (CUS_FLASH_DESC_WORDS + 4); cnt++ )
 				{
-					/* Candidate free area found. Verify that the following (sizeof(desc_t) / 4 + 4) words are all 0xFFFF. */
+					/* Candidate free area found. Verify that the following CUS_FLASH_DESC_WORDS + 4 words are all 0xFFFF. */
 					/* In order to ensure that the free area has enough capacity for one control header and at least 4 words of user data. */
 					if ( *pOperation != 0xFFFFFFFFUL )	
 					{
@@ -1471,7 +1501,7 @@ Cus_Flash_PVDClr( void )
 			return CUS_FLASH_NOSPACE_ERR;
 
 		/* Check if the requested data size exceeds the remaining space.  */
-		if ( (pReq->DataSize + sizeof(desc_t)) > (instance->mgrEndAddr - instance->mgrLowestFreeAddr) )
+		if ( (pReq->DataSize + CUS_FLASH_DESC_SIZE) > (instance->mgrEndAddr - instance->mgrLowestFreeAddr) )
 			return CUS_FLASH_NOSPACE_ERR;
 
 		/* Check if the Record-Poll have free space. */
@@ -1508,28 +1538,28 @@ Cus_Flash_PVDClr( void )
 		#endif /* DEVICE_STM32F4xx */
 
 		#if (DEVICE_STM32F1xx)
-			/* Construct the Control block. */
+			/*
+			 * F1: Write the descriptor with validFlag already set to 0xF0F0 in a
+			 * single pass.  The commit step is omitted because the F1 flash
+			 * controller forbids re‑programming the same half‑word twice.
+			 * Deletion is handled through the delMark field instead.
+			 */
 			desc_t desc;
-			desc.dataStartAddr = instance->mgrLowestFreeAddr + sizeof(desc_t);
-			desc.Magic = CUS_MANAGER_MAGIC;
-			desc.Size = package.bufSize;
-			desc.Type = package.dataType;
-			desc.validFlag = 0xFFFFUL;
+			desc.dataStartAddr = instance->mgrLowestFreeAddr + CUS_FLASH_DESC_SIZE;
+			desc.Magic         = CUS_MANAGER_MAGIC;
+			desc.Size          = package.bufSize;
+			desc.Type          = package.dataType;
+			desc.validFlag     = 0xF0F0UL;     /* already committed */
+			desc.delMark       = 0xFFFFUL;      /* active (not deleted) */
+			desc.reserved      = 0xFFFFUL;
 			memcpy(desc.Desc, package.desc, sizeof(desc.Desc));
 
-			/* Write the control block. */
-			Cus_Flash_State_t hReturn = Cus_Flash_WriteBuffer(instance->mgrLowestFreeAddr, (uint8_t *)&desc, sizeof(desc_t));
+			/* Write descriptor and user data in two passes. */
+			Cus_Flash_State_t hReturn = Cus_Flash_WriteBuffer(instance->mgrLowestFreeAddr, (uint8_t *)&desc, CUS_FLASH_DESC_SIZE);
 			if ( hReturn != CUS_FLASH_OK )
 				return hReturn;
 
-			/* Write the User data. */
-			hReturn = Cus_Flash_WriteBuffer((instance->mgrLowestFreeAddr + sizeof(desc_t)), package.pBuffer, package.bufSize);
-			if ( hReturn != CUS_FLASH_OK )
-				return hReturn;
-
-			/* Write the true validFlag(Commit). */
-			uint16_t commit = 0xF0F0UL;
-			hReturn = Cus_Flash_WriteBuffer(instance->mgrLowestFreeAddr + offsetof(desc_t, validFlag), (uint8_t *)&commit, sizeof(commit));
+			hReturn = Cus_Flash_WriteBuffer((instance->mgrLowestFreeAddr + CUS_FLASH_DESC_SIZE), package.pBuffer, package.bufSize);
 			if ( hReturn != CUS_FLASH_OK )
 				return hReturn;
 		#endif /* DEVICE_STM32F1xx */
@@ -1538,7 +1568,7 @@ Cus_Flash_PVDClr( void )
 		FlashMgr_Record_t Record = 
 		{
 			.msgSize = package.bufSize,
-			.msgStartAddr = (instance->mgrStartAddr + package.Offset + sizeof(desc_t)),
+			.msgStartAddr = (instance->mgrStartAddr + package.Offset + CUS_FLASH_DESC_SIZE),
 			.msgType = package.dataType,
 			.msgDetail = {0}
 		};
@@ -1546,7 +1576,7 @@ Cus_Flash_PVDClr( void )
 		instance->mgrRecords[instance->mgrRecordCount++] = Record; 
 
 		/* Update the lowestFreeAddr. */
-		instance->mgrLowestFreeAddr += sizeof(desc_t) + package.bufSize;
+		instance->mgrLowestFreeAddr += CUS_FLASH_DESC_SIZE + package.bufSize;
 
 		/* Align to the next word boundary. */
 		if ( (instance->mgrLowestFreeAddr & 0x03) )
@@ -1613,12 +1643,23 @@ Cus_Flash_PVDClr( void )
 		if ( !instance->mgrStartAddr || !instance->mgrEndAddr )
 			return CUS_FLASH_PARAMETER;
 
-		/* Change the validFlag in Flash for this record to invalid. */
-		uint32_t controlBlockAddr = (instance->mgrRecords[recordIndex].msgStartAddr - sizeof(desc_t));
-		uint32_t validFlagAddr_inFlash = controlBlockAddr + offsetof(desc_t, validFlag);
-		uint16_t delFlag = 0xF0E0UL;	
-
-		Cus_Flash_State_t hReturn = Cus_Flash_WriteBuffer(validFlagAddr_inFlash, (uint8_t *)&delFlag, sizeof(delFlag));
+		/*
+		 * Mark the record as deleted.
+		 * F1: Write delMark = 0x0000 (a separate half‑word that is still in
+		 *     its erased state, so this is a permitted first‑time programming).
+		 * F4: Write validFlag = 0xF0E0 (0xF0F0→0xF0E0 is a legal 1→0
+		 *     transition on F4 where re‑programming is allowed).
+		 */
+		uint32_t controlBlockAddr = (instance->mgrRecords[recordIndex].msgStartAddr - CUS_FLASH_DESC_SIZE);
+	#if (DEVICE_STM32F1xx)
+		uint32_t delMarkAddr = controlBlockAddr + offsetof(desc_t, delMark);
+		uint16_t mark = 0x0000UL;
+		Cus_Flash_State_t hReturn = Cus_Flash_WriteBuffer(delMarkAddr, (uint8_t *)&mark, sizeof(mark));
+	#else
+		uint32_t validFlagAddr = controlBlockAddr + offsetof(desc_t, validFlag);
+		uint16_t delFlag = 0xF0E0UL;
+		Cus_Flash_State_t hReturn = Cus_Flash_WriteBuffer(validFlagAddr, (uint8_t *)&delFlag, sizeof(delFlag));
+	#endif
 		if ( hReturn != CUS_FLASH_OK )
 		{
 			/* Flash write error. Return. */
@@ -1684,7 +1725,7 @@ Cus_Flash_PVDClr( void )
 			return CUS_FLASH_PARAMETER;
 
 		uint32_t Remain = (instance->mgrEndAddr - instance->mgrLowestFreeAddr);
-		if ( Remain < sizeof(desc_t) )
+		if ( Remain < CUS_FLASH_DESC_SIZE )
 		{
 			/* Not enough space left for the next control head. */
 			/* Return no free space left though there are some space hard to use. */
@@ -1693,7 +1734,7 @@ Cus_Flash_PVDClr( void )
 		else 
 		{
 			/* Return the available user data size(excluding the control header). */
-			*pOut = (Remain - sizeof(desc_t));
+			*pOut = (Remain - CUS_FLASH_DESC_SIZE);
 		}
 
 		return CUS_FLASH_OK;
