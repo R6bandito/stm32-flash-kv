@@ -225,35 +225,31 @@ Cus_FlashMgr_Compact(&cfg_mgr, keep_wifi_only, NULL, backup, sizeof(backup));
 
 ### 3.1 validFlag 后写策略
 
-利用 NOR Flash **只能将 bit 从 1 编程为 0** 的物理特性，设计三态标记：
+利用 NOR Flash **只能将 bit 从 1 编程为 0** 的物理特性，设计多态标记。F1 和 F4 的实现有差异——F1 的 Flash 控制器不允许对同一半字编程超过一次，因此删除路径改用独立的 `delMark` 字段。
 
-| validFlag 值 | 状态 | 说明 |
-|-------------|------|------|
-| `0xFFFF` | 空闲 / 未提交 | Flash 擦除后的默认态。不参与扫描匹配。 |
-| `0xF0F0` | 已提交（有效） | 记录完整写入，可以安全读取。 |
-| `0xF0E0` | 已删除 | 在 `0xF0F0` 基础上将 bit4 从 1→0，不可逆。 |
+| 标记 | F4 行为 | F1 行为 |
+|------|--------|--------|
+| `validFlag = 0xF0F0` | 记录有效（commit 写入） | 记录有效（Append 时一次性写入，不经过 commit） |
+| `validFlag = 0xF0E0` | 已删除（二次编程） | *不使用*（F1 不支持二次编程） |
+| `delMark  = 0xFFFF` | *（字段不存在）* | 未删除（Append 时保持擦除态） |
+| `delMark  = 0x0000` | *（字段不存在）* | 已删除（首次编程 0x0000） |
 
-**状态迁移路径（全部合法，仅涉及 1→0）：**
-
-```
-0xFFFF ──(编程)──▶ 0xF0F0 ──(编程bit4)──▶ 0xF0E0
- 擦除态            已提交              已删除
-```
-
-**写入顺序（Append）：**
+**F4 写入顺序（三步 commit）：**
 
 ```
-1. WriteBuffer(addr,      &desc, 30)    // 写 header 前 30 字节（Magic/Size/DataAddr/Type/Desc）
-                                         // validFlag 位置保持 0xFFFF（未提交）
-2. WriteBuffer(addr + 32, userData, n)   // 写用户数据
-3. WriteBuffer(addr + 30, &commit, 2)   // 写 validFlag = 0xF0F0（提交）
+1. WriteBuffer(addr,      &desc, 30)    // validFlag 保持 0xFFFF（未提交）
+2. WriteBuffer(addr + 32, userData, n)
+3. WriteBuffer(addr + 30, &commit, 2)   // validFlag = 0xF0F0（提交）
 ```
 
-**安全性分析：**
+**F1 写入顺序（两步，无 commit）：**
 
-- 步骤 1 或 2 期间掉电 → validFlag 仍为 `0xFFFF` → 扫描忽略 → **安全**
-- 步骤 3 是 2 字节单次半字写入（原子），要么完成要么未完成 → **安全**
-- 全部完成后掉电 → 记录完整且已提交 → **安全**
+```
+1. WriteBuffer(addr,      &desc, 36)    // 整块 desc_t（36 字节，含 validFlag=0xF0F0）
+2. WriteBuffer(addr + 36, userData, n)
+```
+
+F1 上 validFlag 直接一次写入为 `0xF0F0`，删除时改写独立的 `delMark = 0x0000`。Append 期间掉电时 Magic 未写完 → 扫描忽略 → 安全等价。
 
 ### 3.2 PVD 辅助
 
@@ -279,26 +275,29 @@ Manager 的写入流程可在关键步骤前检查 `gs_lowVoltage`（通过自�
 
 ### 4.1 记录格式
 
-每一条 Manager 记录在 Flash 上的存储结构：
+每一条 Manager 记录在 Flash 上的存储结构（F1 和 F4 大小不同）：
 
 ```
-┌───────────────────────────────────────────────┐
-│  desc_t 头部 (32 bytes)                       │
-│  ┌──────────┬──────────┬────────────────────┐ │
-│  │ Magic    │ Size     │ dataStartAddr      │ │
-│  │ (4B)     │ (4B)     │ (4B)               │ │
-│  ├──────────┼──────────┼──────────┬─────────┤ │
-│  │ Type     │validFlag │ Desc[16]           │ │
-│  │ (2B)     │ (2B)     │                    │ │
-│  └──────────┴──────────┴────────────────────┘ │
-├───────────────────────────────────────────────┤
-│  用户数据 (Size 字节)                          │
-│  ┌──────────────────────────────────────────┐ │
-│  │ ...                                      │ │
-│  └──────────────────────────────────────────┘ │
-├───────────────────────────────────────────────┤
-│  下一记录（addr 按 4 字节对齐）                 │
-└───────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  desc_t 头部 (F1: 36 bytes / F4: 32 bytes)              │
+│  ┌──────────┬──────────┬────────────────────┐           │
+│  │ Magic    │ Size     │ dataStartAddr      │           │
+│  │ (4B)     │ (4B)     │ (4B)               │           │
+│  ├──────────┼──────────┼──────────┬─────────┤           │
+│  │ Type     │validFlag │ Desc[16]           │           │
+│  │ (2B)     │ (2B)     │                    │           │
+│  ├──────────┴──────────┼────────────────────┤ (F1 only) │
+│  │ delMark  │ reserved │    <- 4 bytes      │           │
+│  │ (2B)     │ (2B)     │                    │           │
+│  └──────────┴──────────┴────────────────────┘           │
+├─────────────────────────────────────────────────────────┤
+│  用户数据 (Size 字节)                                    │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ ...                                                │ │
+│  └────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────┤
+│  下一记录（addr 按 4 字节对齐）                           │
+└─────────────────────────────────────────────────────────┘
 ```
 
 | 字段 | 偏移 | 大小 | 说明 |
@@ -307,8 +306,10 @@ Manager 的写入流程可在关键步骤前检查 `gs_lowVoltage`（通过自�
 | Size | 4 | 4 | 后续用户数据字节数 |
 | dataStartAddr | 8 | 4 | 用户数据的绝对 Flash 地址 |
 | Type | 12 | 2 | 应用自定义数据类型标签 |
-| validFlag | 14 | 2 | `0xFFFF`=未提交, `0xF0F0`=有效, `0xF0E0`=已删除 |
+| validFlag | 14 | 2 | `0xF0F0`=有效，F4: `0xF0E0`=已删除 |
 | Desc | 16 | 16 | 人可读描述字符串（null 填充） |
+| delMark | 32 | 2 | **F1 only**：`0xFFFF`=有效, `0x0000`=已删除 |
+| reserved | 34 | 2 | **F1 only**：对齐填充（恒为 `0xFFFF`） |
 
 ### 4.2 区域内存布局
 
@@ -382,7 +383,7 @@ Init 时从头到尾扫描：遇 Magic 匹配 + validFlag 有效则加入 RAM �
 | `Cus_FlashMgr_Init(instance, start, end)` | `Cus_Flash_State_t` | 初始化实例，扫描 Flash 区域重建 RAM 索引 |
 | `Cus_FlashMgr_Append(instance, pReq)` | `Cus_Flash_State_t` | 追加一条记录（自动定位空闲区） |
 | `Cus_FlashMgr_GetRecordByDesc(instance, desc, pOut)` | `Cus_Flash_State_t` | 按描述符查询，返回最新匹配 |
-| `Cus_FlashMgr_DeleteByIndex(instance, index)` | `Cus_Flash_State_t` | 按索引逻辑删除（validFlag → 0xF0E0） |
+| `Cus_FlashMgr_DeleteByIndex(instance, index)` | `Cus_Flash_State_t` | 按索引逻辑删除（F1: delMark→0x0000, F4: validFlag→0xF0E0） |
 | `Cus_FlashMgr_DeleteByDesc(instance, desc)` | `Cus_Flash_State_t` | 按描述符逻辑删除（最新匹配） |
 | `Cus_FlashMgr_DeleteAllByDesc(instance, desc, pCnt)` | `Cus_Flash_State_t` | 批量逻辑删除所有匹配记录 |
 | `Cus_FlashMgr_Compact(instance, cb, ctx, pbuf, size)` | `Cus_Flash_State_t` | 回调式压缩回收：按自定义规则保留记录，释放无效条目占用的物理空间 |
@@ -474,6 +475,7 @@ void Cus_Flash_SYS_Unlock(void)
 - **validFlag 利用 NOR Flash 的 1→0 不可逆特性**，删除后无法恢复
 - **Init 扫描是 O(n)**，大区域可能耗时较长。可通过减少 `FLASH_MGR_MAX_RECORDS` 限制索引规模
 - **PVD 中断优先级应设最高**（当前代码设为 0），确保掉电时最先响应
+- **F1 不允许对同一半字编程两次**：STM32F1 的 Flash 控制器在擦除前每个半字只能编程一次（写 `0x0000` 除外）。F4 无此限制。库已在 `desc_t` 层面通过 `delMark` 字段和平台宏隔离差异，用户无需关注，但自行扩展 on-flash 数据结构时需知悉此约束。
 
 ---
 
